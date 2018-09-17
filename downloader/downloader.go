@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -32,8 +35,9 @@ const (
 )
 
 var (
-	m sync.Mutex
-	// Debug if a flag to enables debug prints
+	sem = semaphore.NewWeighted(8)
+	ctx = context.Background()
+	// Debug is a flag that enables debug prints
 	Debug bool
 	// TimeF is a flag that enables time prints
 	TimeF bool
@@ -195,9 +199,10 @@ func checkListByQuality(pi []playlistInfo, quality string) (list string, ok bool
 	return list, ok
 }
 
-func downloadTS(path string, base string, vodID string, tsNamesCh <-chan string, partsCh <-chan string, done chan<- struct{}) {
-	tsName := <-tsNamesCh
-	tsNum := <-partsCh
+func downloadTS(path string, base string, vodID string, tsName string, tsNum string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	sem.Acquire(ctx, 1)
+	tsURL := base + tsName
 	retryMax := 5
 	var data []byte
 LOOP:
@@ -206,9 +211,7 @@ LOOP:
 		if retry > 0 {
 			debugPrintf("%d try to download %s\n", retry+1, tsName)
 		}
-		m.Lock()
-		resp, err := http.Get(base + tsName)
-		m.Unlock()
+		resp, err := http.Get(tsURL)
 		if err != nil {
 			fatalPrintf(err, "Could not download file %s\n", tsName)
 		}
@@ -236,8 +239,8 @@ LOOP:
 	if err := ioutil.WriteFile(tsFullOSName, data, 0400); err != nil {
 		fatalPrintf(err, "Could not write file %s in %s\n", tsName, path)
 	}
+	sem.Release(1)
 	fmt.Print(".")
-	done <- struct{}{}
 }
 
 func calcTSCountFromStartToEnd(start, end string, targetDuration int) int {
@@ -388,19 +391,13 @@ func DownloadVOD(vodID string, start string, end string, quality string) {
 
 	startT = time.Now()
 	fmt.Println("Started downloading...")
-	tsNamesCh := make(chan string)
-	partsCh := make(chan string)
-	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(tsCountStartEnd)
 	for i := tsStart; i < (tsCountStartEnd + tsStart); i++ {
-		go downloadTS(path, base, vodID, tsNamesCh, partsCh, done)
+		tsName, tsNum := tsList[i], strconv.Itoa(i)
+		go downloadTS(path, base, vodID, tsName, tsNum, &wg)
 	}
-	for i := tsStart; i < (tsCountStartEnd + tsStart); i++ {
-		tsNamesCh <- tsList[i]
-		partsCh <- strconv.Itoa(i)
-	}
-	for i := tsStart; i < (tsCountStartEnd + tsStart); i++ {
-		<-done
-	}
+	wg.Wait()
 	endT = time.Since(startT)
 	if TimeF {
 		fmt.Printf("\nDownloading time: %f seconds", endT.Seconds())
