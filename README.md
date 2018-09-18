@@ -1,4 +1,4 @@
-# There will be README
+# README
 
 Thanks to [fonsleenaars](https://github.com/fonsleenaars/) for information about Usher API and overall [info about HLS and VODs](https://github.com/fonsleenaars/twitch-hls-vods)
 
