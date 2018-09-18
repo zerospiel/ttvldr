@@ -2,7 +2,6 @@ package downloader
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +13,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -28,20 +26,42 @@ const (
 	tsExtension            = ".ts"
 	regTSfile              = ".+[.]ts"
 	regQualityAndM3U8List  = "(VIDEO=\\\".*)\\n.*(\\.m3u8)"
+	regDuration            = "#EXTINF:(\\d+)[.].+"
 	targetDurationStrBegin = "TARGETDURATION:"
 	targetDurationStrEnd   = "\n#ID3"
 	newAPIGetVideo         = "https://api.twitch.tv/helix/videos?id="
 	oldAPIGetVideo         = "https://api.twitch.tv/api/vods/%VODIDREPLACER%/access_token?&client_id="
+	ffmpegBinary           = "ffmpeg"
+	goroutinsLimit         = 8
 )
 
 var (
-	sem = semaphore.NewWeighted(8)
-	ctx = context.Background()
+	sem = make(chan struct{}, goroutinsLimit)
 	// Debug is a flag that enables debug prints
 	Debug bool
 	// TimeF is a flag that enables time prints
 	TimeF bool
 )
+
+func init() {
+	for i := 0; i < goroutinsLimit; i++ {
+		sem <- struct{}{}
+	}
+	f := false
+	cmd := exec.Command(ffmpegBinary)
+	if b, _ := cmd.Output(); b != nil {
+		f = true
+	}
+	if !f {
+		ext := ""
+		dir, _ := filepath.Abs(".")
+		if runtime.GOOS == "windows" {
+			ext += ".exe"
+		}
+		fmt.Printf("There is no ffmpeg%s in current directory %s.\n\nYou can download ffmpeg following this link: %s.\n\nPlace ffmpeg%s in directory with 'ttvldr'.", ext, dir, "https://www.ffmpeg.org/download.html", ext)
+		os.Exit(1)
+	}
+}
 
 func getToken(vodID string) (token string, sig string, err error) {
 	twitchAPIv2 := strings.Replace(oldAPIGetVideo, "%VODIDREPLACER%", vodID, 1)
@@ -114,7 +134,7 @@ func connectTwitch(vodID string) ([]playlistInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("Successfully connected to server")
+
 	return pi, nil
 }
 
@@ -201,7 +221,7 @@ func checkListByQuality(pi []playlistInfo, quality string) (list string, ok bool
 
 func downloadTS(path string, base string, vodID string, tsName string, tsNum string, wg *sync.WaitGroup) {
 	defer wg.Done()
-	sem.Acquire(ctx, 1)
+	<-sem
 	tsURL := base + tsName
 	retryMax := 5
 	var data []byte
@@ -239,11 +259,11 @@ LOOP:
 	if err := ioutil.WriteFile(tsFullOSName, data, 0400); err != nil {
 		fatalPrintf(err, "Could not write file %s in %s\n", tsName, path)
 	}
-	sem.Release(1)
+	sem <- struct{}{}
 	fmt.Print(".")
 }
 
-func calcTSCountFromStartToEnd(start, end string, targetDuration int) int {
+func calcTSCountByTargetDuration(start, end string, targetDuration int) int {
 	ss := convertTimeToSeconds(start)
 	es := convertTimeToSeconds(end)
 	return ((es - ss) / targetDuration) + 1
@@ -317,14 +337,59 @@ func convertTimeToSeconds(timeStr string) int {
 	return seconds
 }
 
-// TODO total duration of part or full VOD
-func calcDurationFromStartToEnd() {
+func calcStartTSAndTSCount(start, end string, durations []float64) (tsStart int, tsCountStartEnd int) {
+	ss, es := float64(convertTimeToSeconds(start)), float64(convertTimeToSeconds(end))
+	partDuration := es - ss
+	sum, rest := 0., 0.
+	// 1.996; 10.; 10.; 10.; 10.; 10.; 10.
+	//    0   1    2    3    4    5    6
+	// ss: 13s; es: 40s; part==27s → start == 2. rest == ss(13) - (sum(21.996) - current_dur(10)) == 1.004s to go. sum=0
+	// for tsStart < len durs: sum += current_dur; if sum > (rest + part) (28.004) {count == 4 - 2 + 1 (3)}
+	for i, d := range durations {
+		sum += d
+		if sum > ss {
+			tsStart, rest = i, (ss - (sum - d))
+			break
+		}
+	}
+	sum = 0.
+	for i := tsStart; i < len(durations); i++ {
+		sum += durations[i]
+		if sum > (rest + partDuration) {
+			tsCountStartEnd = i - tsStart + 1
+		}
+	}
+	if tsCountStartEnd == 0 {
+		tsCountStartEnd = len(durations) - tsStart
+	}
 	return
 }
 
-// TODO get durations from a chosen m3u8 list
-func calcTSDurationsNumbersFromStartToEnd() {
-	return
+func getDurationsFromM3U8List(list string) ([]float64, error) {
+	resp, err := http.Get(list)
+	if err != nil {
+		return nil, fmt.Errorf("getDurationsFromM3U8List: cannot retrieve given m3u8 list. %s", err.Error())
+	}
+	defer resp.Body.Close()
+
+	listStr, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("getDurationsFromM3U8List: cannot read list data. %s", err.Error())
+	}
+	reg := regexp.MustCompile(regDuration)
+	matches := reg.FindAllString(string(listStr), -1)
+	if len(matches) == 0 {
+		return nil, errors.New("getDurationsFromM3U8List: no matches while getting durations")
+	}
+	durations := make([]float64, 0, len(matches))
+	for _, duration := range matches {
+		d, err := strconv.ParseFloat(duration, 64)
+		if err != nil {
+			return nil, fmt.Errorf("getDurationsFromM3U8List: cannot parse duration as float64. %s", err.Error())
+		}
+		durations = append(durations, d)
+	}
+	return durations, nil
 }
 
 // DownloadVOD download defined VOD from start time to end time with certain quality
@@ -334,17 +399,18 @@ func DownloadVOD(vodID string, start string, end string, quality string) {
 	startT := time.Now()
 	pi, err := connectTwitch(vodID)
 	endT := time.Since(startT)
-	if TimeF {
-		fmt.Printf("Connect time: %f seconds\n", endT.Seconds())
-	}
 	if err != nil {
 		fatalPrintf(err, "There was an error while connecting to Twitch server\n")
 	}
+	fmt.Println("Successfully connected to server")
 	debugPrintf("\nUsher API playlists info:\n")
 	if Debug {
 		for _, p := range pi {
 			debugPrintf("Quality: %s. m3u8 link: %s\n", p.quality, p.link)
 		}
+	}
+	if TimeF {
+		fmt.Printf("Connect time: %f seconds\n", endT.Seconds())
 	}
 
 	startT = time.Now()
@@ -361,14 +427,18 @@ func DownloadVOD(vodID string, start string, end string, quality string) {
 
 	tsCountStartEnd, tsStart := 0, 0
 	if end != "-1" {
-		tsCountStartEnd, tsStart = calcTSCountFromStartToEnd(start, end, targetDuration), calcStartTS(start, targetDuration)
+		durations, err := getDurationsFromM3U8List(m3u8link)
+		if len(durations) != len(tsList) || err != nil {
+			tsStart, tsCountStartEnd = calcStartTS(start, targetDuration), calcTSCountByTargetDuration(start, end, targetDuration)
+		} else {
+			tsStart, tsCountStartEnd = calcStartTSAndTSCount(start, end, durations)
+		}
 	} else {
 		fmt.Println("Timestamps didn't defined. Downloading full VOD...")
 		_, tsCountStartEnd = tsStart, len(tsList)
 	}
 	debugPrintf("\n.ts files to download: %d. Starting from %d file in m3u8\n", tsCountStartEnd, tsStart)
 
-	// TODO check pwd more robust
 	pwd := "."
 	path, err := ioutil.TempDir(pwd, vodID+"_")
 	if err != nil {
@@ -383,7 +453,7 @@ func DownloadVOD(vodID string, start string, end string, quality string) {
 		removeTemp(path)
 		os.Exit(1)
 	}(path)
-
+	fmt.Printf("Created new temorary directory %s\n", path)
 	endT = time.Since(startT)
 	if TimeF {
 		fmt.Printf("Preparations time: %f seconds\n", endT.Seconds())
@@ -414,7 +484,6 @@ func DownloadVOD(vodID string, start string, end string, quality string) {
 		fmt.Printf("Converting time: %f seconds\n", endT.Seconds())
 	}
 	fmt.Println("Done")
-	return
 }
 
 func removeTemp(path string) error {
@@ -457,7 +526,7 @@ func concatffmpegFiles(path, vodID string, tsStart, tsCount int) error {
 		fmt.Printf("File %s already exists. Created new file %s\n", vodID+".mp4", fname)
 		vodFile = fname
 	}
-	cmdConcat := exec.Command("ffmpeg", strings.Fields("-f concat -safe 0 -i "+flist+" -c copy -fflags +genpts -bsf:a aac_adtstoasc "+vodFile)...)
+	cmdConcat := exec.Command(ffmpegBinary, strings.Fields("-f concat -safe 0 -i "+flist+" -c copy -fflags +genpts -bsf:a aac_adtstoasc "+vodFile)...)
 	cmdErr := bytes.NewBuffer(nil)
 	cmdConcat.Stderr = cmdErr
 	err = cmdConcat.Run()
@@ -477,30 +546,65 @@ func debugPrintf(format string, opts ...interface{}) {
 
 func fatalPrintf(err error, format string, opts ...interface{}) {
 	if len(format) > 0 {
-		fmt.Printf(format, opts...)
+		fmt.Fprintf(os.Stderr, format, opts...)
 	}
 	debugPrintf(format, err)
 	os.Exit(1)
 }
 
-//New Twitch API
-// TODO print return
-func getVODinfo(vodID string) (interface{}, error) {
+// GetVODInfo print only useful data about given VOD ID
+// It uses New Twitch API, so be sure that using this function is totally safe for user
+func GetVODInfo(vodID string) string {
+	var twData struct {
+		Data []struct {
+			Title       string `json:"title,omitempty"`
+			Type        string `json:"type,omitempty"`
+			ViewCount   int    `json:"view_count,omitempty"`
+			UserID      string `json:"user_id,omitempty"`
+			Duration    string `json:"duration,omitempty"`
+			CreatedAt   string `json:"created_at,omitempty"`
+			Viewable    string `json:"viewable,omitempty"`
+			Language    string `json:"language,omitempty"`
+			Description string `json:"description,omitempty"`
+		} `json:"data"`
+	}
+	done := make(chan string)
+	go printQialityOpts(vodID, done)
 	rs := newAPIGetVideo + vodID
 	req, _ := http.NewRequest("GET", rs, nil)
 	req.Header.Set("Client-ID", twitchClient)
 	var c http.Client
 	resp, err := c.Do(req)
-	// TODO err handling
 	if err != nil {
-		return nil, fmt.Errorf("getVODinfo: cannot retreive VOD info via API. %s", err.Error())
+		fatalPrintf(fmt.Errorf("GetVODInfo: cannot retreive VOD info via API. %s", err.Error()), "Could not retrieve data from server\n")
+		os.Exit(1)
 	}
-	var data interface{}
 	dec := json.NewDecoder(resp.Body)
-	err = dec.Decode(&data)
-	// TODO err handling
+	err = dec.Decode(&twData)
 	if err != nil {
-		return nil, fmt.Errorf("getVODinfo: cannot decode data. %s", err.Error())
+		fatalPrintf(fmt.Errorf("GetVODInfo: cannot decode data. %s", err.Error()), "Could not parse recieved data\n")
+		os.Exit(1)
 	}
-	return data, nil
+	if twData.Data[0].Description == "" {
+		twData.Data[0].Description = "Empty"
+	}
+	t, _ := time.Parse(time.RFC3339, twData.Data[0].CreatedAt)
+	tf := fmt.Sprintf("%d/%d/%d %d:%d", t.Month(), t.Day(), t.Year(), t.Hour(), t.Minute())
+	ret := fmt.Sprintf("\nTitle: %s\nType: %s\nViews: %d\nStreamer ID: %s\nFull duration: %s\nCreated at: %s\nViewable by: %s\nVideo language: %s\nDescription: %s\n", twData.Data[0].Title, strings.Title(twData.Data[0].Type), twData.Data[0].ViewCount, twData.Data[0].UserID, twData.Data[0].Duration, tf, strings.Title(twData.Data[0].Viewable), strings.Title(twData.Data[0].Language), twData.Data[0].Description)
+
+	retQuality := fmt.Sprintf("\nAvailable quality options:\n%s", <-done)
+	return (ret + retQuality)
+}
+
+func printQialityOpts(vodID string, done chan<- string) {
+	pi, err := connectTwitch(vodID)
+	if err != nil {
+		fatalPrintf(err, "There was an error while connecting to Twitch server\n")
+	}
+	buf := bytes.NewBufferString("")
+	for _, q := range pi {
+		buf.WriteString(q.quality)
+		buf.WriteString("\n")
+	}
+	done <- buf.String()
 }
